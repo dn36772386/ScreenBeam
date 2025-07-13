@@ -12,14 +12,14 @@ from reedsolo import RSCodec
 import crcmod
 
 # ------- 送信設定 -------
-FPS               = 60
-GRID_W, GRID_H    = 192, 108
+FPS               = 30  # カメラに合わせて30FPSに変更
+GRID_W, GRID_H    = 96, 54  # 解像度を半分に（640x480カメラ対応）
 CELL_SIZE         = 10
 SCREEN_W          = GRID_W * CELL_SIZE
 SCREEN_H          = GRID_H * CELL_SIZE
 
-# 同期パターン（最初の行に配置）
-SYNC_PATTERN      = [1,0,1,0,1,0,1,0] * 24  # 192ビット
+# 同期パターン（最初の行に配置）- より単純なパターンに変更
+SYNC_PATTERN      = [1,1,1,1,0,0,0,0] * 12  # 96ビット（より識別しやすいパターン）
 
 # 適応的エラー訂正（デフォルトは中程度）
 RS_LEVELS = {
@@ -119,6 +119,8 @@ def main():
     print(f"ファイルサイズ : {file_size:,} bytes")
     print(f"総パケット数   : {len(pkts)-1}")
     print(f"エラー訂正     : {args.rs_level}")
+    print(f"フレームレート : {FPS} FPS")
+    print(f"グリッドサイズ : {GRID_W}×{GRID_H}")
     print(f"理論転送速度   : {data_rate:.1f} KB/秒")
     print(f"推定転送時間   : {file_size/1024/data_rate:.1f} 秒")
     print(f"再送間隔       : {args.interval:.1f} 秒")

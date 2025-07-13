@@ -30,6 +30,20 @@ def optimize_camera(cap):
     """カメラ設定を最適化"""
     print("カメラ設定を最適化中...")
     
+    # HD解像度に設定
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    
+    # 実際に設定された値を確認
+    actual_width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    actual_height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    
+    if actual_width < 1920 or actual_height < 1080:
+        print(f"  ⚠ HD解像度が利用できません: {int(actual_width)}x{int(actual_height)}")
+        # 中間解像度を試す
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
     # 利用可能な設定を確認
     props = {
         'FPS': cv2.CAP_PROP_FPS,
@@ -49,11 +63,15 @@ def optimize_camera(cap):
     
     # 最適化設定
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # バッファ最小化
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FPS, 30)  # 30FPSに設定
     
     # 露出設定（環境に応じて調整）
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 手動モード
-    cap.set(cv2.CAP_PROP_EXPOSURE, -5)  # 短い露出時間
+    # 注：一部のカメラではこれらの設定が効かない場合があります
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 手動モード
+        cap.set(cv2.CAP_PROP_EXPOSURE, -5)  # 短い露出時間
+    except:
+        print("  ⚠ 露出設定をスキップしました")
     
     print("→ 最適化完了")
 
@@ -78,9 +96,17 @@ def preview_loop(cap):
         
         guide = draw_guides(frame)
         
+        # グレースケール変換して明るさ情報を取得
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        min_brightness = np.min(gray)
+        max_brightness = np.max(gray)
+        
         # 情報表示
         cv2.putText(guide, f"FPS: {current_fps:.1f}", 
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        cv2.putText(guide, f"Brightness: {mean_brightness:.0f} ({min_brightness}-{max_brightness})", 
+                    (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         cv2.putText(guide, "SPACE: start  ESC: quit",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         
@@ -88,7 +114,7 @@ def preview_loop(cap):
         k = cv2.waitKey(1) & 0xFF
         if k == 32:      # SPACE
             cv2.destroyWindow("preview")
-            print("→ 受信開始")
+            print(f"→ 受信開始 (明るさ: {mean_brightness:.0f})")
             return True
         elif k == 27:    # ESC
             cv2.destroyWindow("preview")
@@ -96,8 +122,8 @@ def preview_loop(cap):
             return False
 
 # 定数定義
-GRID_W, GRID_H   = 192, 108
-SYNC_PATTERN     = [1,0,1,0,1,0,1,0] * 24  # 192ビット
+GRID_W, GRID_H   = 96, 54  # 送信側と同じに変更
+SYNC_PATTERN     = [1,1,1,1,0,0,0,0] * 12  # 96ビット（より識別しやすいパターン）
 PKT_DATA_SIZE    = 1024
 HEADER_SIZE      = 128
 
@@ -135,13 +161,21 @@ def bits_from_frame(frame_gray, adaptive_thresh=True):
     
     return bits
 
-def find_sync_pattern(bits):
+def find_sync_pattern(bits, debug=False):
     """同期パターンを検出してフレームの開始位置を特定"""
     if len(bits) < len(SYNC_PATTERN):
         return -1
     
-    # 最初の行（192ビット）で同期パターンを確認
+    # 最初の行（96ビット）で同期パターンを確認
     first_row = bits[:GRID_W]
+    
+    if debug:
+        # 同期パターンとの一致度を計算
+        matches = sum(1 for i in range(len(SYNC_PATTERN)) if first_row[i] == SYNC_PATTERN[i])
+        match_rate = matches / len(SYNC_PATTERN) * 100
+        if match_rate > 70:  # 70%以上一致したら表示
+            print(f"同期パターン一致度: {match_rate:.1f}%")
+    
     if first_row == SYNC_PATTERN:
         return 0
     
@@ -200,7 +234,7 @@ def main():
                     help="デバッグ情報を表示")
     args = ap.parse_args()
 
-    cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(args.cam)  # DirectShowを使わない
     if not cap.isOpened():
         print("カメラを開けません")
         return
@@ -240,9 +274,19 @@ def main():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         bits = bits_from_frame(gray, args.adaptive)
         
-        # 同期パターン検出
-        sync_pos = find_sync_pattern(bits)
+        if args.debug and frame_count % 60 == 0:
+            # デバッグ：最初の行のビットパターンを表示
+            first_16_bits = bits[:16] if len(bits) >= 16 else bits
+            pattern_str = ''.join(str(b) for b in first_16_bits)
+            print(f"\n最初の16ビット: {pattern_str}")
+            
+            # 画面の明暗分布を確認
+            bright_count = sum(bits[:GRID_W]) if len(bits) >= GRID_W else 0
+            print(f"最初の行の明るいセル: {bright_count}/{GRID_W}")
+        sync_pos = find_sync_pattern(bits, args.debug)
         if sync_pos != 0:
+            if args.debug and frame_count % 30 == 0:
+                print(f"\r同期待機中... フレーム: {frame_count}", end="")
             continue
         
         sync_count += 1
