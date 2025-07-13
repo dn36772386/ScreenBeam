@@ -1,58 +1,73 @@
-# 最小限のカメラ動作確認コード
+# 最もシンプルなカメラテスト - 問題を特定するため
 
 import cv2
 import numpy as np
 
-# カメラを開く（0は通常内蔵カメラ、1は外付けカメラ）
-camera_index = 0
-cap = cv2.VideoCapture(camera_index)
+print("=== 最小限のカメラテスト ===\n")
+
+# カメラ1をDirectShowで開く
+print("カメラ1をDirectShowで開いています...")
+cap = cv2.VideoCapture(0 + cv2.CAP_DSHOW)
 
 if not cap.isOpened():
-    print(f"エラー: カメラ {camera_index} を開けません")
-    print("\n試してみてください:")
-    print("1. 別のカメラインデックス（1, 2など）を試す")
-    print("2. Webカメラが他のアプリで使用されていないか確認")
-    print("3. カメラのドライバーが正しくインストールされているか確認")
+    print("DirectShow失敗、通常の方法で試します...")
+    cap = cv2.VideoCapture(1)
+
+if not cap.isOpened():
+    print("カメラを開けません")
     exit()
 
-print("カメラが正常に開きました！")
-print(f"解像度: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-print(f"FPS: {cap.get(cv2.CAP_PROP_FPS)}")
-print("\nESCキーで終了します")
+print("カメラを開きました\n")
 
-frame_count = 0
+# 設定前の状態を表示
+print("現在の設定:")
+print(f"  幅: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}")
+print(f"  高さ: {cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+print(f"  FPS: {cap.get(cv2.CAP_PROP_FPS)}")
+print(f"  バックエンド: {cap.getBackendName()}")
 
-while True:
-    # フレームを取得
+# 最初の10フレームの状態を確認
+print("\n最初の10フレームをチェック:")
+for i in range(10):
     ret, frame = cap.read()
-    
-    if ret:
-        frame_count += 1
+    if ret and frame is not None:
+        mean = np.mean(frame)
+        std = np.std(frame)
+        min_val = np.min(frame)
+        max_val = np.max(frame)
+        print(f"フレーム{i}: 平均={mean:.1f}, 標準偏差={std:.1f}, 最小={min_val}, 最大={max_val}")
         
-        # フレーム番号を表示
-        cv2.putText(frame, f"Frame: {frame_count}", (10, 30), 
+        # 1枚保存
+        if i == 5:
+            cv2.imwrite(f"test_frame_{i}.jpg", frame)
+            print(f"  → test_frame_{i}.jpg に保存")
+    else:
+        print(f"フレーム{i}: 取得失敗")
+
+# 簡単な表示
+print("\n映像を表示します（何か映っていますか？）")
+print("ESCで終了")
+
+cv2.namedWindow('Test', cv2.WINDOW_NORMAL)
+
+for i in range(300):  # 10秒間（30fps想定）
+    ret, frame = cap.read()
+    if ret:
+        # 情報追加
+        cv2.putText(frame, f"Frame {i}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
-        # 画面中央に十字線を描画
+        # 中央に十字線
         h, w = frame.shape[:2]
-        cv2.line(frame, (w//2, 0), (w//2, h), (255, 0, 0), 1)
-        cv2.line(frame, (0, h//2), (w, h//2), (255, 0, 0), 1)
+        cv2.line(frame, (w//2-50, h//2), (w//2+50, h//2), (0, 255, 0), 2)
+        cv2.line(frame, (w//2, h//2-50), (w//2, h//2+50), (0, 255, 0), 2)
         
-        # 表示
-        cv2.imshow('Camera Check', frame)
+        cv2.imshow('Test', frame)
         
-        # 's'キーでスクリーンショット保存
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC
+        if cv2.waitKey(33) & 0xFF == 27:  # ESC
             break
-        elif key == ord('s'):
-            cv2.imwrite(f'camera_test_{frame_count}.png', frame)
-            print(f"スクリーンショット保存: camera_test_{frame_count}.png")
-    else:
-        print("警告: フレームを取得できませんでした")
 
-# 後片付け
 cap.release()
 cv2.destroyAllWindows()
 
-print(f"\n合計 {frame_count} フレームを取得しました")
+print("\nテスト終了")

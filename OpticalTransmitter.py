@@ -296,41 +296,77 @@ class OpticalTransmitter:
         """キャリブレーション画面表示"""
         self.init_display()
         
-        # キャリブレーションパターン（チェッカーボード）
-        pattern = np.zeros((self.screen_height, self.screen_width), dtype=np.uint8)
+        print("キャリブレーション画面を表示中...")
+        print("ESCで終了、Spaceで白黒反転")
         
-        for y in range(0, self.grid_height, 2):
-            for x in range(0, self.grid_width, 2):
-                y_start = y * self.cell_size
-                y_end = (y + 1) * self.cell_size
-                x_start = x * self.cell_size
-                x_end = (x + 1) * self.cell_size
-                pattern[y_start:y_end, x_start:x_end] = 255
-                
-        for y in range(1, self.grid_height, 2):
-            for x in range(1, self.grid_width, 2):
-                y_start = y * self.cell_size
-                y_end = (y + 1) * self.cell_size
-                x_start = x * self.cell_size
-                x_end = (x + 1) * self.cell_size
-                pattern[y_start:y_end, x_start:x_end] = 255
-                
-        # 表示
-        surf = pygame.surfarray.make_surface(pattern.T)
-        self.screen.blit(surf, (0, 0))
-        pygame.display.flip()
-        
-        print("キャリブレーション画面を表示中... ESCで終了")
-        
+        # 変調パターンのテスト
+        pattern_mode = 0
         running = True
+        frame_count = 0
+        
         while running:
+            frame_count += 1
+            
+            # パターン生成
+            if pattern_mode == 0:
+                # チェッカーボード
+                pattern = np.zeros((self.screen_height, self.screen_width), dtype=np.uint8)
+                for y in range(0, self.grid_height, 2):
+                    for x in range(0, self.grid_width, 2):
+                        y_start = y * self.cell_size
+                        y_end = (y + 1) * self.cell_size
+                        x_start = x * self.cell_size
+                        x_end = (x + 1) * self.cell_size
+                        pattern[y_start:y_end, x_start:x_end] = 255
+                        
+                for y in range(1, self.grid_height, 2):
+                    for x in range(1, self.grid_width, 2):
+                        y_start = y * self.cell_size
+                        y_end = (y + 1) * self.cell_size
+                        x_start = x * self.cell_size
+                        x_end = (x + 1) * self.cell_size
+                        pattern[y_start:y_end, x_start:x_end] = 255
+                        
+            elif pattern_mode == 1:
+                # 全白
+                pattern = np.full((self.screen_height, self.screen_width), 255, dtype=np.uint8)
+                
+            elif pattern_mode == 2:
+                # 全黒
+                pattern = np.full((self.screen_height, self.screen_width), 0, dtype=np.uint8)
+                
+            elif pattern_mode == 3:
+                # 動的パターン（点滅）
+                if frame_count % 10 < 5:
+                    pattern = np.full((self.screen_height, self.screen_width), 
+                                    self.base_brightness + self.modulation_depth, dtype=np.uint8)
+                else:
+                    pattern = np.full((self.screen_height, self.screen_width), 
+                                    self.base_brightness - self.modulation_depth, dtype=np.uint8)
+            
+            # 表示
+            surf = pygame.surfarray.make_surface(pattern.T)
+            self.screen.blit(surf, (0, 0))
+            
+            # 情報表示
+            font = pygame.font.Font(None, 36)
+            mode_names = ["チェッカーボード", "全白", "全黒", "点滅テスト"]
+            text = font.render(f"Mode: {mode_names[pattern_mode]} (Space to change)", 
+                             True, (128, 128, 128))
+            self.screen.blit(text, (10, 10))
+            
+            pygame.display.flip()
+            self.clock.tick(self.fps)
+            
+            # イベント処理
             for event in pygame.event.get():
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_SPACE:
+                        pattern_mode = (pattern_mode + 1) % 4
+                        print(f"モード変更: {mode_names[pattern_mode]}")
                         
-            time.sleep(0.1)
-            
         pygame.quit()
 
 # 使用例

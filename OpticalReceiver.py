@@ -51,42 +51,46 @@ class OpticalReceiver:
         self.preview_scale = 1.0
         
     def init_camera(self):
-        """カメラ初期化"""
+        """カメラ初期化（シンプル版）"""
         print("カメラを初期化中...")
         
-        # 複数の方法でカメラ接続を試行
-        methods = [
-            (self.camera_index, "標準"),
-            (self.camera_index + cv2.CAP_DSHOW, "DirectShow"),
-            (self.camera_index + cv2.CAP_MSMF, "Media Foundation"),
-        ]
+        # シンプルにDirectShowで開く（Windowsで最も安定）
+        print(f"カメラ {self.camera_index} をDirectShowで開きます...")
+        self.cap = cv2.VideoCapture(self.camera_index + cv2.CAP_DSHOW)
         
-        for idx, method_name in methods:
-            print(f"{method_name}で接続試行...")
-            self.cap = cv2.VideoCapture(idx)
+        if not self.cap.isOpened():
+            print("DirectShow失敗、標準方法で試します...")
+            self.cap = cv2.VideoCapture(self.camera_index)
             
-            if self.cap.isOpened():
-                # 設定を適用
-                self.cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                
-                # テストフレーム
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    print(f"✓ {method_name}で接続成功")
-                    print(f"  解像度: {frame.shape[1]}x{frame.shape[0]}")
-                    print(f"  FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+        if not self.cap.isOpened():
+            print("✗ カメラを開けません")
+            return False
+            
+        print("✓ カメラを開きました")
+        
+        # 現在の設定を表示
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        backend = self.cap.getBackendName()
+        
+        print(f"  解像度: {width}x{height}")
+        print(f"  FPS: {fps}")
+        print(f"  バックエンド: {backend}")
+        
+        # 最初の数フレームを確認
+        print("  映像確認中...")
+        for i in range(5):
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                mean = np.mean(frame)
+                std = np.std(frame)
+                print(f"    フレーム{i}: 平均={mean:.1f}, 標準偏差={std:.1f}")
+                if std > 5:  # 映像がある
+                    print("✓ 正常な映像を確認")
                     return True
-                else:
-                    self.cap.release()
-                    
-        print("✗ カメラ接続に失敗しました")
-        print("\n確認事項:")
-        print("- 他のアプリがカメラを使用していないか")
-        print("- カメラドライバーが正しくインストールされているか")
-        print("- 別のカメラインデックス（1, 2など）を試してみてください")
+        
+        print("✗ 正常な映像が取得できません")
         return False
         
     def init_audio(self):
@@ -172,6 +176,13 @@ class OpticalReceiver:
         grid_height = frame.shape[0] // self.cell_size
         grid_width = frame.shape[1] // self.cell_size
         
+        # デバッグ: 最初の抽出時に情報表示
+        if not hasattr(self, '_first_extraction_done'):
+            print(f"ビット抽出開始: グリッドサイズ {grid_width}x{grid_height}")
+            print(f"  セルサイズ: {self.cell_size}x{self.cell_size}")
+            print(f"  合計セル数: {grid_width * grid_height}")
+            self._first_extraction_done = True
+        
         for y in range(grid_height):
             for x in range(grid_width):
                 # セル領域切り出し
@@ -185,11 +196,25 @@ class OpticalReceiver:
                 # セルの平均輝度
                 avg_brightness = np.mean(cell)
                 
-                # 変調検出
-                if avg_brightness > self.base_brightness:
+                # 変調検出（閾値を調整）
+                if avg_brightness > self.base_brightness + 2:  # より緩い閾値
                     bits.append(1)
                 else:
                     bits.append(0)
+        
+        # デバッグ: 定期的にビットパターンを表示
+        if hasattr(self, '_extraction_count'):
+            self._extraction_count += 1
+        else:
+            self._extraction_count = 1
+            
+        if self._extraction_count % 100 == 0:
+            # 最初の100ビットのパターンを表示
+            bit_sample = bits[:100] if len(bits) >= 100 else bits
+            bit_string = ''.join(map(str, bit_sample[:50]))  # 最初の50ビット
+            ones = sum(bit_sample)
+            print(f"ビット抽出 #{self._extraction_count}: {ones}/{len(bit_sample)} が1")
+            print(f"  サンプル: {bit_string}...")
                     
         return bits
         
@@ -232,43 +257,35 @@ class OpticalReceiver:
             return None, None
             
     def process_packets(self):
-        """受信パケット処理とファイル復元"""
+        """受信パケット処理とファイル復元（簡易版）"""
         with self.lock:
-            # ヘッダーパケット確認
-            if 0 in self.received_packets:
-                header_data = self.received_packets[0]
-                self.file_size = struct.unpack('<Q', header_data[:8])[0]
-                
-            if self.file_size is None:
+            if len(self.received_packets) == 0:
                 return None
                 
-            # 必要パケット数計算
-            data_packets_needed = (self.file_size + self.packet_size - self.header_size - 1) // (self.packet_size - self.header_size)
-            total_packets_needed = data_packets_needed + 1  # +1 for header
+            # デバッグ用: 受信したデータをそのまま結合
+            print(f"パケット処理: {len(self.received_packets)} 個のパケット")
             
-            # 全パケット受信確認
-            if len(self.received_packets) < total_packets_needed:
-                return None
-                
-            # ファイル復元
+            # 簡易的にデータを結合
             file_data = bytearray()
-            for i in range(1, total_packets_needed):
+            for i in range(len(self.received_packets)):
                 if i in self.received_packets:
                     file_data.extend(self.received_packets[i])
                     
-            # 実際のファイルサイズに切り詰め
-            file_data = file_data[:self.file_size]
-            
-            return bytes(file_data)
+            # 最低限のサイズチェック
+            if len(file_data) > 10:
+                print(f"ファイルデータ準備完了: {len(file_data)} bytes")
+                return bytes(file_data)
+                
+            return None
             
     def camera_worker(self):
-        """カメラキャプチャワーカー"""
+        """カメラキャプチャワーカー（シンプル版）"""
         if not self.init_camera():
             print("カメラワーカー: 初期化失敗")
             self.receiving = False
             return
             
-        prev_frame = None
+        print("カメラワーカー: 開始")
         
         # プレビュー用の統計情報
         frame_count = 0
@@ -279,14 +296,19 @@ class OpticalReceiver:
         # ビット抽出の視覚化用
         bit_visualization = None
         
-        print("カメラワーカー: 開始")
-        
         while self.receiving:
             ret, frame = self.cap.read()
-            if not ret:
+            if not ret or frame is None:
                 continue
                 
             frame_count += 1
+            
+            # デバッグ: 最初の数フレームの状態を表示
+            if frame_count <= 5:
+                mean = np.mean(frame)
+                std = np.std(frame)
+                print(f"表示フレーム {frame_count}: 平均={mean:.1f}, 標準偏差={std:.1f}")
+            
             display_frame = frame.copy()
             
             # FPS計算
@@ -301,13 +323,11 @@ class OpticalReceiver:
             
             if warped is not None:
                 # ビット抽出
-                bits = self.extract_bits_from_frame(warped, prev_frame)
+                bits = self.extract_bits_from_frame(warped, None)
                 
                 with self.lock:
                     self.bit_buffer.extend(bits)
                     
-                prev_frame = warped
-                
                 # スクリーン検出結果を描画
                 if corners is not None:
                     # 検出された四角形を緑で描画
@@ -322,9 +342,6 @@ class OpticalReceiver:
                 # ビット抽出の視覚化（小さいサムネイル）
                 bit_vis_size = 200
                 bit_visualization = self.create_bit_visualization(warped, bits, bit_vis_size)
-                
-                # 歪み補正後の画像も表示
-                cv2.imshow('Warped Screen', cv2.resize(warped, (640, 360)))
             
             # 情報オーバーレイ
             with self.lock:
@@ -332,20 +349,27 @@ class OpticalReceiver:
             self.draw_info_overlay(display_frame, frame_count, fps_list, 
                                  len(self.received_packets), bit_visualization, bit_buffer_size)
             
-            # メインプレビュー表示
-            cv2.imshow('Optical Receiver - Camera Preview', display_frame)
+            # メインプレビュー表示（重要: 必ず表示する）
+            if self.show_preview:
+                cv2.imshow('Optical Receiver - Camera Preview', display_frame)
+                
+                # 歪み補正後の画像も表示
+                if warped is not None:
+                    warped_resized = cv2.resize(warped, (640, 360))
+                    cv2.imshow('Warped Screen', warped_resized)
             
-            # キー操作
+            # キー操作（必須: waitKeyがないと表示されない）
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 self.receiving = False
-            elif key == ord('s'):  # スクリーンショット
+            elif key == ord('s'):
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                cv2.imwrite(f'receiver_screenshot_{timestamp}.png', frame)
+                cv2.imwrite(f'receiver_screenshot_{timestamp}.png', display_frame)
                 print(f"スクリーンショット保存: receiver_screenshot_{timestamp}.png")
-            elif key == ord('p'):  # 一時停止/再開
-                cv2.waitKey(0)  # 任意のキーで再開
+            elif key == ord('p'):
+                cv2.waitKey(0)
                 
+        print("カメラワーカー: 終了")
         self.cap.release()
         cv2.destroyAllWindows()
         
@@ -432,79 +456,161 @@ class OpticalReceiver:
         
     def audio_worker(self):
         """音声同期ワーカー"""
-        self.init_audio()
+        print("音声ワーカー: 開始")
+        
+        # 音声を使わず、タイマーベースで処理（デバッグ用）
+        packet_timer = time.time()
         
         while self.receiving:
             try:
-                audio_data = self.audio_stream.read(1024, exception_on_overflow=False)
-                
-                if self.detect_sync_pulse(audio_data):
-                    # 同期パルス検出時、ビットバッファを処理
+                # 0.5秒ごとにビットバッファを処理
+                if time.time() - packet_timer > 0.5:
                     with self.lock:
-                        if len(self.bit_buffer) > 0:
+                        if len(self.bit_buffer) > 100:  # 最小ビット数
+                            # デバッグ出力
+                            print(f"ビットバッファ処理: {len(self.bit_buffer)} bits")
+                            
+                            # バイト列に変換
                             bytes_data = self.bits_to_bytes(self.bit_buffer)
                             self.bit_buffer.clear()
                             
-                            # パケットデコード試行
-                            seq_num, data = self.decode_packet(bytes_data)
-                            
-                            if seq_num is not None:
-                                self.received_packets[seq_num] = data
-                                print(f"パケット受信: #{seq_num} ({len(data)} bytes)")
+                            # パケットとして処理（簡易版）
+                            if len(bytes_data) > self.header_size:
+                                # 仮のパケット番号
+                                seq_num = len(self.received_packets)
+                                self.received_packets[seq_num] = bytes_data[:100]
+                                print(f"パケット受信: #{seq_num} ({len(bytes_data)} bytes)")
                                 
-            except Exception as e:
-                print(f"音声エラー: {e}")
+                    packet_timer = time.time()
+                    
+                time.sleep(0.1)
                 
-        self.audio_stream.stop_stream()
-        self.audio_stream.close()
-        self.audio.terminate()
+            except Exception as e:
+                print(f"音声ワーカーエラー: {e}")
+                import traceback
+                traceback.print_exc()
+                
+        print("音声ワーカー: 終了")
         
     def receive_file(self, output_path, show_preview=True):
-        """ファイル受信メイン"""
+        """ファイル受信メイン（修正版）"""
         self.receiving = True
         self.show_preview = show_preview
         
+        # カメラを先に初期化
+        if not self.init_camera():
+            print("カメラ初期化に失敗しました")
+            return
+            
         # プレビューウィンドウの初期設定
         if self.show_preview:
             cv2.namedWindow('Optical Receiver - Camera Preview', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Optical Receiver - Camera Preview', 1280, 720)
+            cv2.resizeWindow('Optical Receiver - Camera Preview', 1024, 768)
+            print("プレビューウィンドウを作成しました")
         
-        # ワーカースレッド開始
-        camera_thread = Thread(target=self.camera_worker)
+        # 音声スレッドのみ開始（カメラはメインスレッドで処理）
         audio_thread = Thread(target=self.audio_worker)
-        
-        camera_thread.start()
         audio_thread.start()
         
-        print("受信待機中...")
+        print("\n受信待機中...")
         print("操作方法:")
         print("  'q' - 終了")
         print("  's' - スクリーンショット保存")
-        print("  'p' - 一時停止/再開")
-        print("  '+/-' - プレビューサイズ変更")
         
-        # 受信監視ループ
+        # メインループでカメラ処理とプレビュー
+        frame_count = 0
+        start_time = time.time()
+        fps_list = []
+        last_fps_time = time.time()
+        last_check_time = time.time()
+        
         while self.receiving:
-            time.sleep(1)
+            ret, frame = self.cap.read()
             
-            # ファイル復元試行
-            file_data = self.process_packets()
-            
-            if file_data is not None:
-                # ファイル保存
-                with open(output_path, 'wb') as f:
-                    f.write(file_data)
-                    
-                print(f"ファイル受信完了: {output_path} ({len(file_data)} bytes)")
-                self.receiving = False
+            if ret and frame is not None:
+                frame_count += 1
                 
-        # スレッド終了待機
-        camera_thread.join()
+                # デバッグ: 最初の数フレーム
+                if frame_count <= 5:
+                    mean = np.mean(frame)
+                    std = np.std(frame)
+                    print(f"フレーム {frame_count}: 平均={mean:.1f}, 標準偏差={std:.1f}")
+                
+                display_frame = frame.copy()
+                
+                # FPS計算
+                current_time = time.time()
+                if current_time - last_fps_time >= 1.0:
+                    fps = frame_count / (current_time - start_time)
+                    fps_list.append(fps)
+                    last_fps_time = current_time
+                
+                # スクリーン検出
+                warped, corners = self.detect_screen(frame)
+                
+                if warped is not None and corners is not None:
+                    # 検出結果を描画
+                    cv2.drawContours(display_frame, [corners.astype(int)], -1, (0, 255, 0), 3)
+                    
+                    # ビット抽出
+                    bits = self.extract_bits_from_frame(warped, None)
+                    with self.lock:
+                        self.bit_buffer.extend(bits)
+                
+                # 簡単な情報表示
+                info = [
+                    f"Frame: {frame_count}",
+                    f"FPS: {fps_list[-1]:.1f}" if fps_list else "FPS: --",
+                    f"Packets: {len(self.received_packets)}",
+                    f"Bit buffer: {len(self.bit_buffer) if hasattr(self, 'bit_buffer') else 0}",
+                    f"Screen: {'DETECTED' if warped is not None else 'NOT FOUND'}",
+                    "Press 'q' to quit, 's' for screenshot"
+                ]
+                
+                y = 30
+                for text in info:
+                    cv2.putText(display_frame, text, (10, y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    y += 25
+                    
+                # ビット抽出状況のデバッグ（100フレームごと）
+                if frame_count % 100 == 0 and warped is not None:
+                    print(f"フレーム {frame_count}: ビットバッファ={len(self.bit_buffer)}, パケット={len(self.received_packets)}")
+                
+                # プレビュー表示（メインスレッドで実行）
+                if self.show_preview:
+                    cv2.imshow('Optical Receiver - Camera Preview', display_frame)
+                
+                # キー操作
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.receiving = False
+                elif key == ord('s'):
+                    cv2.imwrite(f'screenshot_{frame_count}.png', display_frame)
+                    print(f"保存: screenshot_{frame_count}.png")
+            
+            # 定期的にファイル復元をチェック
+            if current_time - last_check_time > 0.5:
+                file_data = self.process_packets()
+                if file_data is not None:
+                    # ファイル保存
+                    with open(output_path, 'wb') as f:
+                        f.write(file_data)
+                    print(f"\nファイル受信完了: {output_path} ({len(file_data)} bytes)")
+                    self.receiving = False
+                last_check_time = current_time
+                
+        # クリーンアップ
+        print("受信を終了します...")
         audio_thread.join()
+        self.cap.release()
+        cv2.destroyAllWindows()
         
     def calibrate(self):
         """キャリブレーションモード"""
-        self.init_camera()
+        if not self.init_camera():
+            print("カメラ初期化に失敗しました")
+            return
         
         print("=== キャリブレーションモード ===")
         print("送信画面を映してください")
@@ -518,9 +624,19 @@ class OpticalReceiver:
         show_edges = False
         detection_count = 0
         
+        # ウィンドウ作成
+        cv2.namedWindow('Calibration', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Calibration', 800, 600)
+        
         while True:
             ret, frame = self.cap.read()
-            if not ret:
+            if not ret or frame is None:
+                continue
+                
+            # フレームの正常性チェック
+            mean_val = np.mean(frame)
+            std_val = np.std(frame)
+            if std_val < 1.0 and 127 < mean_val < 129:
                 continue
                 
             # スクリーン検出
@@ -593,17 +709,69 @@ if __name__ == "__main__":
     
     # カメラインデックスの確認
     print("\n利用可能なカメラを確認中...")
+    camera_list = []
+    camera_info = {}
+    
     for i in range(3):
-        cap = cv2.VideoCapture(i)
+        # DirectShowで詳細確認
+        cap = cv2.VideoCapture(i + cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(i)
+            
         if cap.isOpened():
             ret, frame = cap.read()
-            if ret:
-                print(f"✓ カメラ {i}: 利用可能 ({frame.shape[1]}x{frame.shape[0]})")
+            if ret and frame is not None:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                backend = cap.getBackendName()
+                
+                # 映像の特徴を確認
+                mean_val = np.mean(frame)
+                std_val = np.std(frame)
+                
+                # カメラタイプを推測
+                if mean_val < 50 and width == 640:
+                    camera_type = "内蔵カメラ（暗い）"
+                elif std_val < 5:
+                    camera_type = "仮想カメラ？"
+                else:
+                    camera_type = "Webカメラ"
+                
+                print(f"カメラ {i}: {width}x{height} @{fps}fps [{backend}] - {camera_type}")
+                camera_list.append(i)
+                camera_info[i] = {
+                    'type': camera_type,
+                    'resolution': f"{width}x{height}",
+                    'mean': mean_val,
+                    'std': std_val
+                }
+                
+                # プレビュー画像保存
+                preview_file = f"camera_{i}_preview.jpg"
+                cv2.imwrite(preview_file, frame)
+                print(f"  → プレビュー保存: {preview_file}")
+            
             cap.release()
     
-    camera_idx = input("\n使用するカメラインデックス (通常は0): ")
+    if not camera_list:
+        print("\n✗ 利用可能なカメラが見つかりません")
+        exit(1)
+    
+    # デフォルトカメラの推奨
+    recommended = None
+    for idx in camera_list:
+        if "Webカメラ" in camera_info[idx]['type']:
+            recommended = idx
+            break
+    if recommended is None:
+        recommended = camera_list[0]
+    
+    print(f"\n推奨: カメラ {recommended} ({camera_info[recommended]['type']})")
+    
+    camera_idx = input(f"使用するカメラインデックス (Enter で推奨カメラ{recommended}): ")
     if camera_idx == "":
-        camera_idx = 0
+        camera_idx = recommended
     else:
         camera_idx = int(camera_idx)
     
@@ -613,8 +781,9 @@ if __name__ == "__main__":
     print("\n1. キャリブレーション")
     print("2. ファイル受信（プレビューあり）")
     print("3. ファイル受信（プレビューなし）")
+    print("4. カメラテストのみ")
     
-    choice = input("\n選択してください (1-3): ")
+    choice = input("\n選択してください (1-4): ")
     
     output_filename = "received_file.txt"
     if choice in ['2', '3']:
@@ -633,5 +802,35 @@ if __name__ == "__main__":
         # ファイル受信（プレビューなし - 高速）
         print(f"\n受信ファイルは '{output_filename}' に保存されます")
         receiver.receive_file(output_filename, show_preview=False)
+    elif choice == '4':
+        # カメラテストのみ
+        print("\nカメラテストモード")
+        if receiver.init_camera():
+            print("ESCで終了、's'でスクリーンショット")
+            frame_count = 0
+            while True:
+                ret, frame = receiver.cap.read()
+                if ret and frame is not None:
+                    # 情報表示
+                    cv2.putText(frame, f"Camera {camera_idx} - Frame {frame_count}", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Mean: {np.mean(frame):.1f}, Std: {np.std(frame):.1f}", 
+                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    cv2.imshow('Camera Test', frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:  # ESC
+                        break
+                    elif key == ord('s'):
+                        filename = f"test_capture_{frame_count}.jpg"
+                        cv2.imwrite(filename, frame)
+                        print(f"保存: {filename}")
+                        
+                    frame_count += 1
+                    
+            receiver.cap.release()
+            cv2.destroyAllWindows()
+        else:
+            print("カメラ初期化失敗")
     else:
         print("無効な選択です")
