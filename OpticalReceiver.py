@@ -63,13 +63,17 @@ def optimize_camera(cap):
     
     # 最適化設定
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # バッファ最小化
-    cap.set(cv2.CAP_PROP_FPS, 30)  # 30FPSに設定
+    cap.set(cv2.CAP_PROP_FPS, 10)  # 10FPSに設定（送信側と同じ）
+    
+    # 明るさとコントラストを調整（画面が暗い問題に対処）
+    cap.set(cv2.CAP_PROP_BRIGHTNESS, 160)  # 明るさを上げる
+    cap.set(cv2.CAP_PROP_CONTRAST, 50)     # コントラストを上げる
     
     # 露出設定（環境に応じて調整）
     # 注：一部のカメラではこれらの設定が効かない場合があります
     try:
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 手動モード
-        cap.set(cv2.CAP_PROP_EXPOSURE, -5)  # 短い露出時間
+        cap.set(cv2.CAP_PROP_EXPOSURE, -4)  # 露出を少し明るめに
     except:
         print("  ⚠ 露出設定をスキップしました")
     
@@ -78,6 +82,7 @@ def optimize_camera(cap):
 def preview_loop(cap):
     """位置合わせ用のプレビュー。SPACE で確定、ESC で終了"""
     print("プレビュー開始（SPACE で受信開始、ESC で終了）")
+    print("ヒント: モニターの輝度を最大にしてください")
     
     # FPS計測用
     fps_counter = collections.deque(maxlen=30)
@@ -107,6 +112,12 @@ def preview_loop(cap):
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         cv2.putText(guide, f"Brightness: {mean_brightness:.0f} ({min_brightness}-{max_brightness})", 
                     (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        
+        # 明るさが低い場合の警告
+        if mean_brightness < 50:
+            cv2.putText(guide, "WARNING: Too dark! Increase monitor brightness", 
+                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        
         cv2.putText(guide, "SPACE: start  ESC: quit",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         
@@ -115,6 +126,8 @@ def preview_loop(cap):
         if k == 32:      # SPACE
             cv2.destroyWindow("preview")
             print(f"→ 受信開始 (明るさ: {mean_brightness:.0f})")
+            if mean_brightness < 50:
+                print("⚠ 警告: 画面が暗すぎます。モニターの輝度を上げてください。")
             return True
         elif k == 27:    # ESC
             cv2.destroyWindow("preview")
@@ -123,8 +136,9 @@ def preview_loop(cap):
 
 # 定数定義
 GRID_W, GRID_H   = 96, 54  # 送信側と同じに変更
-SYNC_PATTERN     = [1,1,1,1,0,0,0,0] * 12  # 96ビット（より識別しやすいパターン）
+SYNC_PATTERN     = [1] * 48 + [0] * 48  # 半分白、半分黒
 PKT_DATA_SIZE    = 1024
+PKT_FULL_SIZE    = 1058  # RSコード追加後のサイズ（デフォルト）
 HEADER_SIZE      = 128
 
 # エラー訂正レベル
@@ -139,25 +153,60 @@ CRC32 = crcmod.mkCrcFun(0x104C11DB7, initCrc=0, xorOut=0xFFFFFFFF)
 def bits_from_frame(frame_gray, adaptive_thresh=True):
     """フレームからビット列を抽出（適応的閾値対応）"""
     h, w = frame_gray.shape
-    cell_w = w // GRID_W
-    cell_h = h // GRID_H
+    
+    # 画面中央の適切な領域を切り出し（画面端のノイズを避ける）
+    margin_x = w // 10
+    margin_y = h // 10
+    roi = frame_gray[margin_y:h-margin_y, margin_x:w-margin_x]
+    roi_h, roi_w = roi.shape
+    
+    cell_w = roi_w // GRID_W
+    cell_h = roi_h // GRID_H
+    
+    # 画面全体の明るさを確認
+    overall_mean = roi.mean()
     
     if adaptive_thresh:
-        # 適応的閾値処理
-        thresh_img = cv2.adaptiveThreshold(frame_gray, 255, 
+        # 適応的閾値処理（ブロックサイズを調整）
+        block_size = max(3, min(cell_w, cell_h) // 2)
+        if block_size % 2 == 0:
+            block_size += 1
+        thresh_img = cv2.adaptiveThreshold(roi, 255, 
                                          cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 11, 2)
+                                         cv2.THRESH_BINARY, block_size, 10)
     else:
-        # 固定閾値
-        thresh = np.median(frame_gray)
-        _, thresh_img = cv2.threshold(frame_gray, thresh, 255, cv2.THRESH_BINARY)
+        # Otsuの閾値処理を使用（より安定）
+        _, thresh_img = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     bits = []
     for gy in range(GRID_H):
         for gx in range(GRID_W):
-            block = thresh_img[gy*cell_h:(gy+1)*cell_h, gx*cell_w:(gx+1)*cell_w]
-            avg = block.mean()
-            bits.append(1 if avg > 127 else 0)
+            y1 = gy * cell_h
+            y2 = min((gy + 1) * cell_h, roi_h)
+            x1 = gx * cell_w
+            x2 = min((gx + 1) * cell_w, roi_w)
+            
+            block = thresh_img[y1:y2, x1:x2]
+            if block.size > 0:
+                # 中央部分の平均を取る（エッジのノイズを避ける）
+                center_y = block.shape[0] // 4
+                center_x = block.shape[1] // 4
+                if center_y > 0 and center_x > 0:
+                    center_block = block[center_y:-center_y, center_x:-center_x]
+                    if center_block.size > 0:
+                        avg = center_block.mean()
+                    else:
+                        avg = block.mean()
+                else:
+                    avg = block.mean()
+                
+                # 画面が暗い場合は閾値を調整
+                if overall_mean < 50:
+                    bits.append(1 if avg > 100 else 0)
+                else:
+                    bits.append(1 if avg > 127 else 0)
+            else:
+                bits.append(0)
     
     return bits
 
@@ -169,14 +218,21 @@ def find_sync_pattern(bits, debug=False):
     # 最初の行（96ビット）で同期パターンを確認
     first_row = bits[:GRID_W]
     
-    if debug:
-        # 同期パターンとの一致度を計算
-        matches = sum(1 for i in range(len(SYNC_PATTERN)) if first_row[i] == SYNC_PATTERN[i])
-        match_rate = matches / len(SYNC_PATTERN) * 100
-        if match_rate > 70:  # 70%以上一致したら表示
-            print(f"同期パターン一致度: {match_rate:.1f}%")
+    # 同期パターンとの一致度を計算
+    matches = sum(1 for i in range(len(SYNC_PATTERN)) if first_row[i] == SYNC_PATTERN[i])
+    match_rate = matches / len(SYNC_PATTERN) * 100
     
-    if first_row == SYNC_PATTERN:
+    if debug and match_rate > 50:  # 50%以上一致したら表示
+        print(f"\n同期パターン一致度: {match_rate:.1f}%")
+        # 詳細な比較
+        expected_white = sum(SYNC_PATTERN[:48])
+        actual_white = sum(first_row[:48])
+        expected_black = 48 - sum(SYNC_PATTERN[48:])
+        actual_black = 48 - sum(first_row[48:])
+        print(f"前半（白）: {actual_white}/{expected_white}, 後半（黒）: {actual_black}/{expected_black}")
+    
+    # 80%以上一致したら同期成功とする（完全一致は難しい）
+    if match_rate >= 80:
         return 0
     
     return -1
@@ -207,7 +263,8 @@ def bits_to_bytes(bits):
 def decode_packet(buf, rs_codec):
     try:
         body = rs_codec.decode(buf)
-    except ReedSolomonError:
+    except (ReedSolomonError, Exception) as e:
+        return None, None
         return None, None
     
     if len(body) < 8:
@@ -228,11 +285,14 @@ def main():
     ap.add_argument("--outfile", default="received_file.txt")
     ap.add_argument("--nopreview", action="store_true",
                     help="位置合わせプレビューをスキップ")
-    ap.add_argument("--adaptive", action="store_true",
-                    help="適応的閾値処理を使用")
+    ap.add_argument("--no-adaptive", action="store_true",
+                    help="適応的閾値処理を無効化")
     ap.add_argument("--debug", action="store_true",
                     help="デバッグ情報を表示")
     args = ap.parse_args()
+    
+    # 適応的閾値のフラグ設定
+    use_adaptive = not args.no_adaptive
 
     cap = cv2.VideoCapture(args.cam)  # DirectShowを使わない
     if not cap.isOpened():
@@ -264,6 +324,12 @@ def main():
     
     print("受信待機中...")
     print("同期パターンを検索中...")
+    print("\n💡 トラブルシューティング:")
+    print("  1. モニターの輝度を最大に")
+    print("  2. カメラをモニターに正対させる")
+    print("  3. グリッド全体が画面に収まるように調整")
+    print("  4. 部屋を暗くしてみる")
+    print()
     
     while True:
         ret, frame = cap.read()
@@ -272,17 +338,29 @@ def main():
         
         frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        bits = bits_from_frame(gray, args.adaptive)
+        bits = bits_from_frame(gray, use_adaptive)
         
         if args.debug and frame_count % 60 == 0:
             # デバッグ：最初の行のビットパターンを表示
-            first_16_bits = bits[:16] if len(bits) >= 16 else bits
-            pattern_str = ''.join(str(b) for b in first_16_bits)
-            print(f"\n最初の16ビット: {pattern_str}")
+            first_48_bits = bits[:48] if len(bits) >= 48 else bits
+            last_48_bits = bits[48:96] if len(bits) >= 96 else []
             
-            # 画面の明暗分布を確認
+            first_pattern = ''.join(str(b) for b in first_48_bits)
+            last_pattern = ''.join(str(b) for b in last_48_bits)
+            
+            print(f"\n=== フレーム {frame_count} ===")
+            print(f"前半48ビット: {first_pattern[:16]}... (白: {sum(first_48_bits)}/48)")
+            print(f"後半48ビット: {last_pattern[:16]}... (黒: {48-sum(last_48_bits)}/48)")
+            
+            # 画面の明暗情報
             bright_count = sum(bits[:GRID_W]) if len(bits) >= GRID_W else 0
             print(f"最初の行の明るいセル: {bright_count}/{GRID_W}")
+            
+            # 画面全体の統計
+            if len(bits) >= GRID_W * GRID_H:
+                total_bright = sum(bits)
+                total_cells = GRID_W * GRID_H
+                print(f"画面全体の明るいセル: {total_bright}/{total_cells} ({total_bright/total_cells*100:.1f}%)")
         sync_pos = find_sync_pattern(bits, args.debug)
         if sync_pos != 0:
             if args.debug and frame_count % 30 == 0:
@@ -307,28 +385,42 @@ def main():
             hdr = bits_to_bytes(header_bits)
             
             try:
-                file_size, total_pkts, _, sha16, rs_level_byte = struct.unpack(">QII16sB", hdr[:33])
-                rs_level = rs_level_byte
-                rs_codec = RS_LEVELS.get(rs_level, RS_LEVELS[1])
-                header_parsed = True
-                
-                print(f"\n=== ヘッダー情報 ===")
-                print(f"ファイルサイズ : {file_size:,} bytes")
-                print(f"総パケット数   : {total_pkts}")
-                print(f"エラー訂正     : {['light', 'medium', 'strong'][rs_level]}")
-                print()
-                
-                packets[0] = hdr
-                continue
-            except:
+                if len(hdr) >= 33:  # 最小サイズチェック
+                    file_size, total_pkts, _, sha16, rs_level_byte = struct.unpack(">QII16sB", hdr[:33])
+                    
+                    # 妥当性チェック
+                    if file_size > 0 and file_size < 1000000000 and total_pkts > 0 and total_pkts < 10000:
+                        rs_level = rs_level_byte
+                        rs_codec = RS_LEVELS.get(rs_level, RS_LEVELS[1])
+                        header_parsed = True
+                        
+                        print(f"\n=== ヘッダー情報 ===")
+                        print(f"ファイルサイズ : {file_size:,} bytes")
+                        print(f"総パケット数   : {total_pkts}")
+                        print(f"エラー訂正     : {['light', 'medium', 'strong'][rs_level] if rs_level < 3 else 'unknown'}")
+                        print()
+                        
+                        packets[0] = hdr
+                        continue
+                    else:
+                        if args.debug:
+                            print(f"⚠ 不正なヘッダー値: size={file_size}, pkts={total_pkts}")
+            except Exception as e:
+                if args.debug:
+                    print(f"⚠ ヘッダー解析エラー: {e}")
                 error_count += 1
                 continue
         
         # データパケット処理
         if header_parsed:
             # パケットサイズを計算
-            pkt_size = rs_codec.encode(b'x' * (PKT_DATA_SIZE + 8))
-            pkt_bits = len(pkt_size) * 8
+            try:
+                test_data = b'x' * (PKT_DATA_SIZE + 8)
+                pkt_size = len(rs_codec.encode(test_data))
+                pkt_bits = pkt_size * 8
+            except:
+                # デフォルトサイズ
+                pkt_bits = PKT_FULL_SIZE * 8
             
             if len(data_bits) >= pkt_bits:
                 pkt_bits_data = data_bits[:pkt_bits]
@@ -346,9 +438,19 @@ def main():
             print(f"\n--- 統計情報 ---")
             print(f"フレーム数     : {frame_count}")
             print(f"同期成功数     : {sync_count}")
-            print(f"同期成功率     : {sync_count/frame_count*100:.1f}%")
+            if frame_count > 0:
+                print(f"同期成功率     : {sync_count/frame_count*100:.1f}%")
             print(f"エラー数       : {error_count}")
             print(f"受信パケット   : {len(packets)-1 if header_parsed else 0}/{total_pkts or '?'}")
+            
+            # ヒント表示
+            if sync_count == 0 and frame_count > 100:
+                print("\n💡 ヒント:")
+                print("1. モニターの輝度を最大にしてください")
+                print("2. カメラとモニターの距離・角度を調整してください")
+                print("3. 部屋の照明を暗くしてみてください")
+                print("4. --no-adaptive オプションを試してください")
+            
             last_report = time.time()
         
         # 完了判定

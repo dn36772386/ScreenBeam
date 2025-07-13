@@ -12,14 +12,14 @@ from reedsolo import RSCodec
 import crcmod
 
 # ------- 送信設定 -------
-FPS               = 30  # カメラに合わせて30FPSに変更
+FPS               = 10  # さらに下げて確実性を高める
 GRID_W, GRID_H    = 96, 54  # 解像度を半分に（640x480カメラ対応）
 CELL_SIZE         = 10
 SCREEN_W          = GRID_W * CELL_SIZE
 SCREEN_H          = GRID_H * CELL_SIZE
 
-# 同期パターン（最初の行に配置）- より単純なパターンに変更
-SYNC_PATTERN      = [1,1,1,1,0,0,0,0] * 12  # 96ビット（より識別しやすいパターン）
+# 同期パターン（最初の行に配置）- 半分白、半分黒
+SYNC_PATTERN      = [1] * 48 + [0] * 48  # 半分白、半分黒
 
 # 適応的エラー訂正（デフォルトは中程度）
 RS_LEVELS = {
