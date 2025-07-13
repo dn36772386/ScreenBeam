@@ -11,6 +11,7 @@ import zlib
 from threading import Thread, Lock
 import queue
 from collections import deque
+from datetime import datetime
 
 class OpticalReceiver:
     def __init__(self):
@@ -45,12 +46,48 @@ class OpticalReceiver:
         self.receiving = False
         self.file_size = None
         
+        # プレビュー設定
+        self.show_preview = True
+        self.preview_scale = 1.0
+        
     def init_camera(self):
         """カメラ初期化"""
-        self.cap = cv2.VideoCapture(self.camera_index)
-        self.cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        print("カメラを初期化中...")
+        
+        # 複数の方法でカメラ接続を試行
+        methods = [
+            (self.camera_index, "標準"),
+            (self.camera_index + cv2.CAP_DSHOW, "DirectShow"),
+            (self.camera_index + cv2.CAP_MSMF, "Media Foundation"),
+        ]
+        
+        for idx, method_name in methods:
+            print(f"{method_name}で接続試行...")
+            self.cap = cv2.VideoCapture(idx)
+            
+            if self.cap.isOpened():
+                # 設定を適用
+                self.cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # テストフレーム
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    print(f"✓ {method_name}で接続成功")
+                    print(f"  解像度: {frame.shape[1]}x{frame.shape[0]}")
+                    print(f"  FPS: {self.cap.get(cv2.CAP_PROP_FPS)}")
+                    return True
+                else:
+                    self.cap.release()
+                    
+        print("✗ カメラ接続に失敗しました")
+        print("\n確認事項:")
+        print("- 他のアプリがカメラを使用していないか")
+        print("- カメラドライバーが正しくインストールされているか")
+        print("- 別のカメラインデックス（1, 2など）を試してみてください")
+        return False
         
     def init_audio(self):
         """音声入力初期化"""
@@ -226,14 +263,39 @@ class OpticalReceiver:
             
     def camera_worker(self):
         """カメラキャプチャワーカー"""
-        self.init_camera()
+        if not self.init_camera():
+            print("カメラワーカー: 初期化失敗")
+            self.receiving = False
+            return
+            
         prev_frame = None
+        
+        # プレビュー用の統計情報
+        frame_count = 0
+        start_time = time.time()
+        fps_list = []
+        last_fps_time = time.time()
+        
+        # ビット抽出の視覚化用
+        bit_visualization = None
+        
+        print("カメラワーカー: 開始")
         
         while self.receiving:
             ret, frame = self.cap.read()
             if not ret:
                 continue
                 
+            frame_count += 1
+            display_frame = frame.copy()
+            
+            # FPS計算
+            current_time = time.time()
+            if current_time - last_fps_time >= 1.0:
+                fps = frame_count / (current_time - start_time)
+                fps_list.append(fps)
+                last_fps_time = current_time
+            
             # スクリーン検出と歪み補正
             warped, corners = self.detect_screen(frame)
             
@@ -246,17 +308,127 @@ class OpticalReceiver:
                     
                 prev_frame = warped
                 
-                # デバッグ表示
+                # スクリーン検出結果を描画
                 if corners is not None:
-                    cv2.drawContours(frame, [corners.astype(int)], -1, (0, 255, 0), 2)
+                    # 検出された四角形を緑で描画
+                    cv2.drawContours(display_frame, [corners.astype(int)], -1, (0, 255, 0), 3)
                     
-            cv2.imshow('Receiver', frame)
+                    # 各頂点に番号を表示
+                    for i, point in enumerate(corners):
+                        cv2.circle(display_frame, tuple(point.astype(int)), 5, (0, 0, 255), -1)
+                        cv2.putText(display_frame, str(i+1), tuple(point.astype(int) + 10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                # ビット抽出の視覚化（小さいサムネイル）
+                bit_vis_size = 200
+                bit_visualization = self.create_bit_visualization(warped, bits, bit_vis_size)
+                
+                # 歪み補正後の画像も表示
+                cv2.imshow('Warped Screen', cv2.resize(warped, (640, 360)))
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # 情報オーバーレイ
+            with self.lock:
+                bit_buffer_size = len(self.bit_buffer)
+            self.draw_info_overlay(display_frame, frame_count, fps_list, 
+                                 len(self.received_packets), bit_visualization, bit_buffer_size)
+            
+            # メインプレビュー表示
+            cv2.imshow('Optical Receiver - Camera Preview', display_frame)
+            
+            # キー操作
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 self.receiving = False
+            elif key == ord('s'):  # スクリーンショット
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                cv2.imwrite(f'receiver_screenshot_{timestamp}.png', frame)
+                print(f"スクリーンショット保存: receiver_screenshot_{timestamp}.png")
+            elif key == ord('p'):  # 一時停止/再開
+                cv2.waitKey(0)  # 任意のキーで再開
                 
         self.cap.release()
         cv2.destroyAllWindows()
+        
+    def create_bit_visualization(self, warped_frame, bits, size):
+        """ビット抽出結果の視覚化画像を作成"""
+        if warped_frame is None or not bits:
+            return None
+            
+        # グリッドサイズ計算
+        grid_height = warped_frame.shape[0] // self.cell_size
+        grid_width = warped_frame.shape[1] // self.cell_size
+        
+        # ビット値を画像化（白=1、黒=0）
+        bit_image = np.zeros((grid_height, grid_width), dtype=np.uint8)
+        
+        bit_index = 0
+        for y in range(grid_height):
+            for x in range(grid_width):
+                if bit_index < len(bits):
+                    bit_image[y, x] = 255 if bits[bit_index] == 1 else 0
+                    bit_index += 1
+                    
+        # リサイズして返す
+        return cv2.resize(bit_image, (size, size), interpolation=cv2.INTER_NEAREST)
+        
+    def draw_info_overlay(self, frame, frame_count, fps_list, packet_count, bit_vis, bit_buffer_size):
+        """情報オーバーレイを描画"""
+        # 半透明の背景
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (400, 250), (0, 0, 0), -1)
+        frame[:] = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+        
+        # テキスト情報
+        current_fps = fps_list[-1] if fps_list else 0
+        avg_fps = sum(fps_list) / len(fps_list) if fps_list else 0
+        
+        info_lines = [
+            f"Frame: {frame_count}",
+            f"FPS: {current_fps:.1f} (avg: {avg_fps:.1f})",
+            f"Resolution: {frame.shape[1]}x{frame.shape[0]}",
+            f"Packets received: {packet_count}",
+            f"Bit buffer size: {bit_buffer_size}",
+            "",
+            "Controls:",
+            "  'q' - Quit",
+            "  's' - Screenshot",
+            "  'p' - Pause"
+        ]
+        
+        y_offset = 30
+        for line in info_lines:
+            cv2.putText(frame, line, (20, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            y_offset += 25
+            
+        # ビット視覚化表示
+        if bit_vis is not None:
+            # 右上に表示
+            vis_y = 10
+            vis_x = frame.shape[1] - bit_vis.shape[1] - 10
+            
+            # カラー画像に変換（グレースケール→BGR）
+            bit_vis_color = cv2.cvtColor(bit_vis, cv2.COLOR_GRAY2BGR)
+            
+            # 枠を追加
+            cv2.rectangle(bit_vis_color, (0, 0), 
+                        (bit_vis.shape[1]-1, bit_vis.shape[0]-1), (0, 255, 0), 2)
+            
+            # フレームに配置
+            frame[vis_y:vis_y+bit_vis.shape[0], vis_x:vis_x+bit_vis.shape[1]] = bit_vis_color
+            
+            # ラベル追加
+            cv2.putText(frame, "Extracted Bits", (vis_x, vis_y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+        # ステータスバー
+        status_text = "RECEIVING" if self.receiving else "STOPPED"
+        status_color = (0, 255, 0) if self.receiving else (0, 0, 255)
+        
+        cv2.rectangle(frame, (0, frame.shape[0]-30), 
+                     (frame.shape[1], frame.shape[0]), status_color, -1)
+        cv2.putText(frame, f"Status: {status_text} | File size: {self.file_size or 'Unknown'}", 
+                   (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
     def audio_worker(self):
         """音声同期ワーカー"""
@@ -287,9 +459,15 @@ class OpticalReceiver:
         self.audio_stream.close()
         self.audio.terminate()
         
-    def receive_file(self, output_path):
+    def receive_file(self, output_path, show_preview=True):
         """ファイル受信メイン"""
         self.receiving = True
+        self.show_preview = show_preview
+        
+        # プレビューウィンドウの初期設定
+        if self.show_preview:
+            cv2.namedWindow('Optical Receiver - Camera Preview', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Optical Receiver - Camera Preview', 1280, 720)
         
         # ワーカースレッド開始
         camera_thread = Thread(target=self.camera_worker)
@@ -298,7 +476,12 @@ class OpticalReceiver:
         camera_thread.start()
         audio_thread.start()
         
-        print("受信待機中... 'q'で終了")
+        print("受信待機中...")
+        print("操作方法:")
+        print("  'q' - 終了")
+        print("  's' - スクリーンショット保存")
+        print("  'p' - 一時停止/再開")
+        print("  '+/-' - プレビューサイズ変更")
         
         # 受信監視ループ
         while self.receiving:
@@ -323,8 +506,17 @@ class OpticalReceiver:
         """キャリブレーションモード"""
         self.init_camera()
         
-        print("キャリブレーション中... 送信画面を映してください")
-        print("'s'でスクリーン検出結果を保存、'q'で終了")
+        print("=== キャリブレーションモード ===")
+        print("送信画面を映してください")
+        print("\n操作方法:")
+        print("  's' - スクリーン検出結果を保存")
+        print("  'c' - セルグリッド表示切替")
+        print("  'e' - エッジ検出表示切替")
+        print("  'q' - 終了")
+        
+        show_grid = True
+        show_edges = False
+        detection_count = 0
         
         while True:
             ret, frame = self.cap.read()
@@ -335,16 +527,43 @@ class OpticalReceiver:
             warped, corners = self.detect_screen(frame)
             
             if warped is not None and corners is not None:
+                detection_count += 1
+                
                 # 検出結果を描画
-                cv2.drawContours(frame, [corners.astype(int)], -1, (0, 255, 0), 2)
+                cv2.drawContours(frame, [corners.astype(int)], -1, (0, 255, 0), 3)
+                
+                # 頂点番号表示
+                for i, point in enumerate(corners):
+                    cv2.circle(frame, tuple(point.astype(int)), 8, (0, 0, 255), -1)
+                    cv2.putText(frame, f"{i+1}", tuple(point.astype(int) + 15), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
                 
                 # セルグリッド表示
-                for i in range(0, warped.shape[0], self.cell_size):
-                    cv2.line(warped, (0, i), (warped.shape[1], i), (128, 128, 128), 1)
-                for i in range(0, warped.shape[1], self.cell_size):
-                    cv2.line(warped, (i, 0), (i, warped.shape[0]), (128, 128, 128), 1)
+                if show_grid:
+                    grid_overlay = warped.copy()
+                    for i in range(0, warped.shape[0], self.cell_size):
+                        cv2.line(grid_overlay, (0, i), (warped.shape[1], i), (0, 255, 0), 1)
+                    for i in range(0, warped.shape[1], self.cell_size):
+                        cv2.line(grid_overlay, (i, 0), (i, warped.shape[0]), (0, 255, 0), 1)
                     
-                cv2.imshow('Warped', warped)
+                    cv2.imshow('Warped with Grid', grid_overlay)
+                else:
+                    cv2.imshow('Warped', warped)
+                
+                # エッジ検出表示
+                if show_edges:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 50, 150)
+                    cv2.imshow('Edge Detection', edges)
+                
+                # 統計情報
+                cv2.putText(frame, f"Detection: {detection_count}", (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Grid cells: {warped.shape[1]//self.cell_size} x {warped.shape[0]//self.cell_size}", 
+                          (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, "Screen not detected", (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
             cv2.imshow('Calibration', frame)
             
@@ -352,18 +571,67 @@ class OpticalReceiver:
             if key == ord('q'):
                 break
             elif key == ord('s') and warped is not None:
-                cv2.imwrite('calibration_result.png', warped)
-                print("キャリブレーション結果を保存しました")
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                cv2.imwrite(f'calibration_frame_{timestamp}.png', frame)
+                cv2.imwrite(f'calibration_warped_{timestamp}.png', warped)
+                print(f"キャリブレーション結果を保存しました")
+            elif key == ord('c'):
+                show_grid = not show_grid
+                print(f"グリッド表示: {'ON' if show_grid else 'OFF'}")
+            elif key == ord('e'):
+                show_edges = not show_edges
+                if not show_edges:
+                    cv2.destroyWindow('Edge Detection')
                 
         self.cap.release()
         cv2.destroyAllWindows()
 
 # 使用例
 if __name__ == "__main__":
+    print("AIRCODE風 光学通信受信プログラム")
+    print("================================")
+    
+    # カメラインデックスの確認
+    print("\n利用可能なカメラを確認中...")
+    for i in range(3):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret:
+                print(f"✓ カメラ {i}: 利用可能 ({frame.shape[1]}x{frame.shape[0]})")
+            cap.release()
+    
+    camera_idx = input("\n使用するカメラインデックス (通常は0): ")
+    if camera_idx == "":
+        camera_idx = 0
+    else:
+        camera_idx = int(camera_idx)
+    
     receiver = OpticalReceiver()
+    receiver.camera_index = camera_idx
     
-    # キャリブレーション
-    # receiver.calibrate()
+    print("\n1. キャリブレーション")
+    print("2. ファイル受信（プレビューあり）")
+    print("3. ファイル受信（プレビューなし）")
     
-    # ファイル受信
-    receiver.receive_file("received_file.txt")
+    choice = input("\n選択してください (1-3): ")
+    
+    output_filename = "received_file.txt"
+    if choice in ['2', '3']:
+        custom = input("\n保存ファイル名 (Enterでreceived_file.txt): ")
+        if custom:
+            output_filename = custom
+    
+    if choice == '1':
+        # キャリブレーション
+        receiver.calibrate()
+    elif choice == '2':
+        # ファイル受信（プレビューあり）
+        print(f"\n受信ファイルは '{output_filename}' に保存されます")
+        receiver.receive_file(output_filename, show_preview=True)
+    elif choice == '3':
+        # ファイル受信（プレビューなし - 高速）
+        print(f"\n受信ファイルは '{output_filename}' に保存されます")
+        receiver.receive_file(output_filename, show_preview=False)
+    else:
+        print("無効な選択です")
