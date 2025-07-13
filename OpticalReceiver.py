@@ -6,6 +6,7 @@ import cv2
 import pyaudio
 import struct
 import time
+import os
 from reedsolo import RSCodec, ReedSolomonError
 import zlib
 from threading import Thread, Lock
@@ -262,6 +263,10 @@ class OpticalReceiver:
             if len(self.received_packets) == 0:
                 return None
                 
+            # 最低限10パケット受信するまで待つ
+            if len(self.received_packets) < 10:
+                return None
+                
             # デバッグ用: 受信したデータをそのまま結合
             print(f"パケット処理: {len(self.received_packets)} 個のパケット")
             
@@ -271,11 +276,24 @@ class OpticalReceiver:
                 if i in self.received_packets:
                     file_data.extend(self.received_packets[i])
                     
-            # 最低限のサイズチェック
-            if len(file_data) > 10:
+            # 受信データの内容を確認
+            if len(file_data) > 0:
+                # 最初の50バイトを表示
+                preview = file_data[:50]
+                preview_text = ''
+                for b in preview:
+                    if 32 <= b <= 126:  # 印刷可能な文字
+                        preview_text += chr(b)
+                    else:
+                        preview_text += '.'
+                        
+                print(f"受信データプレビュー: {preview_text}...")
                 print(f"ファイルデータ準備完了: {len(file_data)} bytes")
-                return bytes(file_data)
                 
+                # ファイルサイズが妥当か確認（100～10000バイト）
+                if 100 <= len(file_data) <= 10000:
+                    return bytes(file_data)
+                    
             return None
             
     def camera_worker(self):
@@ -466,20 +484,18 @@ class OpticalReceiver:
                 # 0.5秒ごとにビットバッファを処理
                 if time.time() - packet_timer > 0.5:
                     with self.lock:
-                        if len(self.bit_buffer) > 100:  # 最小ビット数
+                        if len(self.bit_buffer) > 1000:  # 最小ビット数を増やす
                             # デバッグ出力
                             print(f"ビットバッファ処理: {len(self.bit_buffer)} bits")
                             
                             # バイト列に変換
-                            bytes_data = self.bits_to_bytes(self.bit_buffer)
-                            self.bit_buffer.clear()
+                            bytes_data = self.bits_to_bytes(self.bit_buffer[:1000])  # 1000ビットずつ処理
+                            self.bit_buffer = self.bit_buffer[1000:]  # 残りを保持
                             
-                            # パケットとして処理（簡易版）
-                            if len(bytes_data) > self.header_size:
-                                # 仮のパケット番号
-                                seq_num = len(self.received_packets)
-                                self.received_packets[seq_num] = bytes_data[:100]
-                                print(f"パケット受信: #{seq_num} ({len(bytes_data)} bytes)")
+                            # パケットとして処理
+                            seq_num = len(self.received_packets)
+                            self.received_packets[seq_num] = bytes_data
+                            print(f"パケット受信: #{seq_num} ({len(bytes_data)} bytes)")
                                 
                     packet_timer = time.time()
                     

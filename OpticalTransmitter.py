@@ -4,7 +4,6 @@
 import numpy as np
 import cv2
 import pygame
-import pyaudio
 import struct
 import time
 import os
@@ -37,10 +36,6 @@ class OpticalTransmitter:
         # 誤り訂正設定
         self.rs = RSCodec(10)    # Reed-Solomon 10バイト冗長
         
-        # 音声同期設定
-        self.sync_freq = 19000   # Hz
-        self.sync_duration = 0.01 # seconds
-        
         # キュー
         self.packet_queue = queue.Queue()
         self.frame_queue = queue.Queue(maxsize=5)
@@ -58,19 +53,34 @@ class OpticalTransmitter:
         
     def init_audio(self):
         """音声出力初期化"""
-        self.audio = pyaudio.PyAudio()
-        self.audio_stream = self.audio.open(
-            format=pyaudio.paFloat32,
-            channels=1,
-            rate=44100,
-            output=True
-        )
+        try:
+            self.audio = pyaudio.PyAudio()
+            # 設定を調整
+            self.audio_stream = self.audio.open(
+                format=pyaudio.paFloat32,
+                channels=1,
+                rate=44100,
+                output=True,
+                frames_per_buffer=512  # バッファサイズを小さく
+            )
+            print("音声出力を初期化しました")
+        except Exception as e:
+            print(f"音声初期化エラー: {e}")
+            print("音声同期は無効になります")
+            self.audio = None
+            self.audio_stream = None
         
     def generate_sync_pulse(self):
         """同期用音声パルス生成"""
         samples = int(44100 * self.sync_duration)
         t = np.linspace(0, self.sync_duration, samples)
-        pulse = 0.5 * np.sin(2 * np.pi * self.sync_freq * t)
+        # 音量を下げて、より短いパルスに
+        pulse = 0.1 * np.sin(2 * np.pi * self.sync_freq * t)
+        # フェードイン・フェードアウト
+        fade_samples = int(samples * 0.1)
+        for i in range(fade_samples):
+            pulse[i] *= (i / fade_samples)
+            pulse[-(i+1)] *= (i / fade_samples)
         return pulse.astype(np.float32).tobytes()
         
     def file_to_packets(self, filepath):
@@ -167,10 +177,8 @@ class OpticalTransmitter:
     def transmit_file(self, filepath, repeat=False, repeat_delay=5.0):
         """ファイル送信メイン"""
         self.init_display()
-        self.init_audio()
-        
-        # 同期パルス
-        sync_pulse = self.generate_sync_pulse()
+        # 音声は使用しない
+        # self.init_audio()
         
         running = True
         
@@ -205,6 +213,7 @@ class OpticalTransmitter:
                     if frame is None:
                         # 送信完了
                         print(f"送信完了 - {frame_count} フレーム送信")
+                        print(f"待機中... (ESCで終了、SPACEでスキップ)")
                         encode_thread.join()
                         
                         if repeat:
@@ -216,25 +225,12 @@ class OpticalTransmitter:
                             surf = pygame.surfarray.make_surface(black_frame.T)
                             self.screen.blit(surf, (0, 0))
                             
-                            # カウントダウン表示
-                            font = pygame.font.Font(None, 72)
+                            # カウントダウンは表示しない（データ領域を妨げないため）
+                            pygame.display.flip()
                             
                             wait_start = time.time()
                             while time.time() - wait_start < repeat_delay:
-                                remaining = int(repeat_delay - (time.time() - wait_start))
-                                
-                                # 画面クリア
-                                self.screen.fill((0, 0, 0))
-                                
-                                # カウントダウンテキスト
-                                text = font.render(f"Next: {remaining}s", True, (50, 50, 50))
-                                text_rect = text.get_rect(center=(self.screen_width//2, self.screen_height//2))
-                                self.screen.blit(text, text_rect)
-                                
-                                pygame.display.flip()
-                                self.clock.tick(10)
-                                
-                                # イベント処理
+                                # イベント処理のみ
                                 for event in pygame.event.get():
                                     if event.type == pygame.QUIT:
                                         running = False
@@ -250,6 +246,8 @@ class OpticalTransmitter:
                                 if not running:
                                     break
                                     
+                                self.clock.tick(10)
+                                    
                             # フレームキューをクリア
                             while not self.frame_queue.empty():
                                 self.frame_queue.get()
@@ -258,21 +256,10 @@ class OpticalTransmitter:
                         else:
                             running = False
                             break
-                        
-                    # フレーム開始時に同期音
-                    if frame_count % 30 == 0:  # 0.5秒ごと
-                        self.audio_stream.write(sync_pulse)
-                        
-                    # 画面に表示
+                    
+                    # 画面に表示（ステータス表示なし - データ領域を妨げないため）
                     surf = pygame.surfarray.make_surface(frame.T)
                     self.screen.blit(surf, (0, 0))
-                    
-                    # ステータス表示
-                    font = pygame.font.Font(None, 36)
-                    status_text = f"Frame: {frame_count} | Packets: {packet_count//30}"
-                    text_surface = font.render(status_text, True, (100, 100, 100))
-                    self.screen.blit(text_surface, (10, 10))
-                    
                     pygame.display.flip()
                     
                     # FPS制御
@@ -288,9 +275,6 @@ class OpticalTransmitter:
                 
         # クリーンアップ
         pygame.quit()
-        self.audio_stream.stop_stream()
-        self.audio_stream.close()
-        self.audio.terminate()
         
     def calibrate(self):
         """キャリブレーション画面表示"""
@@ -298,6 +282,7 @@ class OpticalTransmitter:
         
         print("キャリブレーション画面を表示中...")
         print("ESCで終了、Spaceで白黒反転")
+        print("データ領域には何も表示しません")
         
         # 変調パターンのテスト
         pattern_mode = 0
@@ -344,17 +329,9 @@ class OpticalTransmitter:
                     pattern = np.full((self.screen_height, self.screen_width), 
                                     self.base_brightness - self.modulation_depth, dtype=np.uint8)
             
-            # 表示
+            # 表示（情報は表示しない）
             surf = pygame.surfarray.make_surface(pattern.T)
             self.screen.blit(surf, (0, 0))
-            
-            # 情報表示
-            font = pygame.font.Font(None, 36)
-            mode_names = ["チェッカーボード", "全白", "全黒", "点滅テスト"]
-            text = font.render(f"Mode: {mode_names[pattern_mode]} (Space to change)", 
-                             True, (128, 128, 128))
-            self.screen.blit(text, (10, 10))
-            
             pygame.display.flip()
             self.clock.tick(self.fps)
             
@@ -365,6 +342,7 @@ class OpticalTransmitter:
                         running = False
                     elif event.key == pygame.K_SPACE:
                         pattern_mode = (pattern_mode + 1) % 4
+                        mode_names = ["チェッカーボード", "全白", "全黒", "点滅テスト"]
                         print(f"モード変更: {mode_names[pattern_mode]}")
                         
         pygame.quit()
@@ -376,13 +354,24 @@ if __name__ == "__main__":
     print("AIRCODE風 光学通信送信プログラム")
     print("================================")
     
-    # サンプルファイルの確認・作成
-    import os
-    if not os.path.exists("sample.txt"):
-        print("\nサンプルファイル 'sample.txt' が見つかりません")
-        create = input("作成しますか？ (y/n): ")
-        if create.lower() == 'y':
-            with open("sample.txt", "w", encoding="utf-8") as f:
+    # ファイル選択
+    print("\n送信するファイルを選択してください:")
+    print("1. sample.txt（デフォルト）")
+    print("2. 別のファイルを指定")
+    
+    file_choice = input("\n選択 (1-2): ")
+    
+    if file_choice == '2':
+        filename = input("ファイル名を入力: ")
+        if not os.path.exists(filename):
+            print(f"エラー: {filename} が見つかりません")
+            exit(1)
+    else:
+        filename = "sample.txt"
+        # サンプルファイルの確認・作成
+        if not os.path.exists(filename):
+            print("\nサンプルファイル 'sample.txt' を作成します")
+            with open(filename, "w", encoding="utf-8") as f:
                 f.write("AIRCODE Test Message\n")
                 f.write("=" * 50 + "\n")
                 f.write("This is a test file for optical communication.\n")
@@ -392,18 +381,18 @@ if __name__ == "__main__":
                 f.write("=" * 50 + "\n")
             print("サンプルファイルを作成しました")
     
-    print("\n1. 単発送信")
+    # ファイル情報表示
+    file_size = os.path.getsize(filename)
+    print(f"\n送信ファイル: {filename}")
+    print(f"ファイルサイズ: {file_size} bytes")
+    
+    print("\n送信モードを選択:")
+    print("1. 単発送信")
     print("2. リピート送信（5秒間隔）")
-    print("3. 連続送信（間隔なし）")
+    print("3. 連続送信（1秒間隔）")
     print("4. キャリブレーション")
     
     choice = input("\n選択してください (1-4): ")
-    
-    filename = "sample.txt"
-    if choice in ['1', '2', '3']:
-        custom = input("\n別のファイルを送信しますか？ (Enterでsample.txt): ")
-        if custom:
-            filename = custom
     
     if choice == '1':
         # 単発送信
@@ -411,12 +400,11 @@ if __name__ == "__main__":
     elif choice == '2':
         # リピート送信（5秒間隔）
         print("\nリピート送信モード（ESCで終了）")
-        print("スペースキーで待機をスキップできます")
         transmitter.transmit_file(filename, repeat=True, repeat_delay=5.0)
     elif choice == '3':
         # 連続送信
         print("\n連続送信モード（ESCで終了）")
-        transmitter.transmit_file(filename, repeat=True, repeat_delay=0.5)
+        transmitter.transmit_file(filename, repeat=True, repeat_delay=1.0)
     elif choice == '4':
         # キャリブレーション
         transmitter.calibrate()
